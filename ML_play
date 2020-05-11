@@ -1,0 +1,338 @@
+# %load ML_diplay.py
+"""
+机器学习建模
+"""
+import pandas as pd
+import numpy as np
+import sys
+import os
+import lightgbm as lgb
+from  datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from sklearn.externals import joblib
+import gc
+import warnings
+warnings.filterwarnings('ignore')
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+path = "/content/drive/My Drive/1 - Walmart M5 Accuracy" 
+os.chdir(path)
+
+def create_train_data(train_start=750,test_start=1800,is_train=True):
+    # 基本参数
+    PRICE_DTYPES = {"store_id": "category", "item_id": "category", "wm_yr_wk": "int16","sell_price":"float32" }
+    CAL_DTYPES={"event_name_1": "category", "event_name_2": "category", "event_type_1": "category", 
+            "event_type_2": "category", "weekday": "category", 'wm_yr_wk': 'int16', "wday": "int16",
+            "month": "int8", "year": "int16", "snap_CA": "int8", 'snap_TX': 'int8', 'snap_WI': 'int8' }
+
+    start_day = train_start if is_train else test_start
+    numcols = [f"d_{day}" for day in range(start_day,1914)]
+    catcols = ['id', 'item_id', 'dept_id','store_id', 'cat_id', 'state_id']
+    SALE_DTYPES = {numcol: "float32" for numcol in numcols} 
+    SALE_DTYPES.update({col: "category" for col in catcols if col != "id"})
+
+    # 加载price数据
+    price_data = pd.read_csv('sell_prices.csv',dtype=PRICE_DTYPES)
+    # 加载cal数据
+    cal_data = pd.read_csv('calendar.csv',dtype=CAL_DTYPES)
+    # 加载sale数据
+    sale_data = pd.read_csv('sales_train_validation.csv',dtype=SALE_DTYPES,usecols=catcols+numcols)
+
+    # # 根据季节和趋势强度对item进行分类
+    # score_strength = pd.read_csv('score_strength.csv')
+    # sale_data = pd.merge(sale_data,score_strength,on='id')
+    # sale_data['s'] = sale_data['s'].apply(lambda x: 1 if x < 0.95 else 0)
+    # sale_data['t'] = sale_data['t'].apply(lambda x: 1 if x < 0.88 else 0)
+    # sale_data[['s','t']] = sale_data[['s','t']].astype('int8')
+
+    # 获取每个item的权重
+    # weights = pd.read_csv('weights_validation.csv')
+    # weights = weights[weights['Level_id'] == 'Level12']
+    # weights['id'] = weights['Agg_Level_1'] + '_' + weights['Agg_Level_2'] + '_validation'
+    # sale_data = pd.merge(sale_data,weights[['id','Weight']],on='id')
+    # sale_data['Weight'] = sale_data['Weight'].astype('float32')
+
+    # 类别标签转换
+    for col, col_dtype in PRICE_DTYPES.items():
+        if col_dtype == "category":
+            price_data[col] = price_data[col].cat.codes.astype("int16") 
+            #↑cat方法将category转换为CategoricalAccessor对象，codes方法以Series返回该对象的所有类名及对应索引，用于将类标签转为数值
+            price_data[col] -= price_data[col].min() #令类标签从0开始
+
+    cal_data["date"] = pd.to_datetime(cal_data["date"])
+    cal_data, CAL_DTYPES = event_features(cal_data,CAL_DTYPES,3)
+    for col, col_dtype in CAL_DTYPES.items():
+        if col_dtype == "category":
+            cal_data[col] = cal_data[col].cat.codes.astype("int16")
+            cal_data[col] -= cal_data[col].min()
+
+    for col in catcols:
+        if col != "id":
+            sale_data[col] = sale_data[col].cat.codes.astype("int16")
+            sale_data[col] -= sale_data[col].min()
+
+    if not is_train:
+        for day in range(1913+1, 1913+ 2*28 +1):
+            sale_data[f"d_{day}"] = np.nan
+    # melt函数：将数据分为三部分：①id-like的列；②variables列：将指定列的列名，融合到一列中；③values列：将被融合的列的值，与融合后的列一一对应
+    sale_data = pd.melt(sale_data,
+            # id_vars = catcols + ['s','t','Weight'],
+            id_vars = catcols,
+            value_vars = [col for col in sale_data.columns if col.startswith("d_")],
+            var_name = "d",
+            value_name = "sales")
+    sale_data = sale_data.merge(cal_data, on= "d", copy = False)
+    sale_data = sale_data.merge(price_data, on = ["store_id", "item_id", "wm_yr_wk"], copy = False)
+
+    # 处理时间特征
+    # 有的时间特征没有，通过datetime的方法自动生成
+    date_features = {
+            "wday": "weekday",
+            "week": "weekofyear",
+            "month": "month",
+            "quarter": "quarter",
+            "year": "year",
+            "mday": "day",}
+
+    for date_feat_name, date_feat_func in date_features.items():
+        if date_feat_name in sale_data.columns:
+            pass
+        else:
+            sale_data[date_feat_name] = getattr(sale_data["date"].dt, date_feat_func).astype("int16")
+
+    sale_data.drop(["wm_yr_wk", "weekday"],axis=1,inplace=True)
+
+    return sale_data
+
+
+def create_feature(sale_data, is_train=True, day=None):
+    # 可以在这里加入更多的特征抽取方法
+    # 获取7天前的数据，28天前的数据
+    lags = [7, 28]
+    lag_cols = [f"lag_{lag}" for lag in lags ]
+
+    # 如果是测试集只需要计算一天的特征，减少计算量
+    # 注意训练集和测试集特征生成要一致
+    if is_train:
+        for lag, lag_col in zip(lags, lag_cols):
+            sale_data[lag_col] = sale_data[["id","sales"]].groupby("id")["sales"].shift(lag)
+    else:
+        for lag, lag_col in zip(lags, lag_cols):
+            sale_data.loc[sale_data.date == day, lag_col] = sale_data.loc[sale_data.date ==day-timedelta(days=lag), 'sales'].values
+            # day变量是指需要预测的日期。这里直接取需要预测的日期对应的lag的数据，而没有用shift函数，减小了计算量（不用冗余地处理非预测日期的数据）  
+
+
+    # 将获取7天前的数据，28天前的数据做移动平均
+    wins = [7, 28]
+
+    if is_train:
+        for win in wins :
+            for lag,lag_col in zip(lags, lag_cols):
+                sale_data[f"rmean_{lag}_{win}"] = sale_data[["id", lag_col]].groupby("id")[lag_col].transform(lambda x : x.rolling(win).mean()).astype('float32')
+    else:
+        for win in wins:
+            for lag in lags:
+                # 取lag天前，窗口大小为win的日期的数据【i.e.取两个时间节点间的数据】
+                df_window = sale_data[(sale_data.date <= day-timedelta(days=lag)) & (sale_data.date > day-timedelta(days=lag+win))]
+                df_window_grouped = df_window.groupby("id").agg({'sales':'mean'}).reindex(sale_data.loc[sale_data.date==day,'id'])['sales']
+                sale_data.loc[sale_data.date == day, f"rmean_{lag}_{win}"] = df_window_grouped.astype('float32').values
+    return sale_data
+
+def train_model(train_data,valid_data):
+    params = {"objective" : "tweedie",
+              "metric" :"rmse",
+              "force_row_wise" : True,
+              "learning_rate" : 0.075,
+              "sub_feature" : 0.8,
+              "sub_row" : 0.75,
+              "bagging_freq" : 1,
+              "lambda_l2" : 0.1,
+              "nthread": 8,
+              "tweedie_variance_power":1.2,
+              'verbosity': 1,
+              'num_iterations' : 1500,
+              'num_leaves': 128,
+              "min_data_in_leaf": 104,
+              }
+
+    m_lgb = lgb.train(params, train_data, valid_sets = [train_data, valid_data], verbose_eval=50)
+
+    return m_lgb
+
+
+def predict_ensemble(train_cols,m_lgb):
+    date = datetime(2016,4,25) 
+    # 选择要乘以的系数
+    alphas = [1.035, 1.03, 1.025]
+    weights = [1/len(alphas)]*len(alphas)
+    sub = 0.
+
+    test_data = create_train_data(is_train=False)
+
+    for icount, (alpha, weight) in enumerate(zip(alphas, weights)):
+
+        test_data_c = test_data.copy()
+        cols = [f"F{i}" for i in range(1,29)]
+
+
+        for i in range(0, 28):
+            day = date + timedelta(days=i)
+            print(i, day)
+            tst = test_data_c[(test_data_c.date >= day - timedelta(days=57)) & (test_data_c.date <= day)].copy()
+            tst = create_feature(tst,is_train=False, day=day)
+            tst = tst.loc[tst.date == day , train_cols]
+            test_data_c.loc[test_data_c.date == day, "sales"] = alpha*m_lgb.predict(tst)
+
+        # 改为提交数据的格式
+        test_sub = test_data_c.loc[test_data_c.date >= date, ["id", "sales"]].copy()
+        test_sub["F"] = [f"F{rank}" for rank in test_sub.groupby("id")["id"].cumcount()+1]
+        test_sub = test_sub.set_index(["id", "F"]).unstack()["sales"][cols].reset_index()
+        test_sub.fillna(0., inplace = True)
+        test_sub.sort_values("id", inplace = True)
+        test_sub.reset_index(drop=True, inplace = True)
+        # test_sub.to_csv(f"submission_{icount}.csv",index=False)
+        if icount == 0 :
+            sub = test_sub
+            sub[cols] *= weight
+        else:
+            sub[cols] += test_sub[cols]*weight
+        print(icount, alpha, weight)
+    
+    sub2 = sub.copy()
+    # 把大于28天后的validation替换成evaluation
+    sub2["id"] = sub2["id"].str.replace("validation$", "evaluation")
+    sub = pd.concat([sub, sub2], axis=0, sort=False)
+    sub.to_csv("submission_v13.csv",index=False)
+   
+   '''
+构造节日特征：
+日期前后三天有无节日？有几个节日？距离节日几天？
+'''
+def event_features(calendar,cal_dtypes,span):
+  events_list = np.concatenate([calendar[calendar.event_name_1.notnull()].event_name_1.unique(),calendar[calendar.event_name_2.notnull()].event_name_2.unique()])
+
+  # 抽取节日前n天的日期
+  event_info_b = {}
+  for event in events_list:
+    event_date = calendar[(calendar.event_name_1 == event) | (calendar.event_name_2 == event)].date
+    event_info_b[event] = sum([list(zip((event_date - timedelta(i)).to_list(),[i]*len(event_date))) for i in range(1,span+1)],[])
+  days_before_events = {}
+  for (event,info) in event_info_b.items():
+    for date, i in info:
+      if date not in days_before_events:
+        days_before_events[date] = [(event,i)]
+      else:
+        days_before_events[date].append((event,i))
+
+  # 抽取节日后n天的日期
+  event_info_a = {}
+  for event in events_list:
+    event_date = calendar[(calendar.event_name_1 == event) | (calendar.event_name_2 == event)].date
+    event_info_a[event] = sum([list(zip((event_date + timedelta(i)).to_list(),[i]*len(event_date))) for i in range(1,span+1)],[])
+  days_after_events = {}
+  for (event,info) in event_info_a.items():
+    for date, i in info:
+      if date not in days_after_events:
+        days_after_events[date] = [(event,i)]
+      else:
+        days_after_events[date].append((event,i))
+  
+  calendar['before_events'] = calendar.date.apply(lambda x: tuple(days_before_events[x]) if x in days_before_events else np.nan)
+  calendar['after_events'] = calendar.date.apply(lambda x: tuple(days_after_events[x]) if x in days_after_events else np.nan)
+  calendar[['before_events','after_events']] = calendar[['before_events','after_events']].astype('category')
+
+  cal_dtypes['before_events'], cal_dtypes['after_events'] = 'category', 'category'
+
+  return calendar, cal_dtypes
+  
+  # 辅助函数
+# 1.内存优化
+def reduce_mem_usage(df, verbose=True):
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2    
+    for col in df.columns:
+        if col != 'sales':
+            col_type = df[col].dtypes
+            if col_type in numerics:
+                c_min = df[col].min()
+                c_max = df[col].max()
+                if str(col_type)[:3] == 'int':
+                    if c_min >= np.iinfo(np.uint8).min and c_max <= np.iinfo(np.uint8).max:
+                        df[col] = df[col].astype(np.uint8)
+                    elif c_min >= np.iinfo(np.uint16).min and c_max <= np.iinfo(np.uint16).max:
+                        df[col] = df[col].astype(np.uint16)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        df[col] = df[col].astype(np.int32)
+                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                        df[col] = df[col].astype(np.int64)  
+                else:
+                    if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                        df[col] = df[col].astype(np.float16)
+                    elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        df[col] = df[col].astype(np.float32)
+                    else:
+                        df[col] = df[col].astype(np.float64)    
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose: print('Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+    return df
+
+# 2.RMSSE评估
+def evaluate(valid_sets):
+    import pickle
+    with open('/content/drive/My Drive/1 - Walmart M5 Accuracy/Evaluation/submission_index.pkl','rb') as f:
+        submission_index = pickle.load(f)
+    with open('/content/drive/My Drive/1 - Walmart M5 Accuracy/Evaluation/valid_id.pkl','rb') as f:
+        valid_pred = pickle.load(f)
+    with open('/content/drive/My Drive/1 - Walmart M5 Accuracy/Evaluation/evaluate.pkl','rb') as f:
+        e = pickle.load(f)
+    valid_pred['sales'] = m_lgb.predict(valid_sets)
+    valid_pred = valid_pred.set_index(['id','d']).unstack()['sales']
+    valid_pred = valid_pred.reindex(submission_index).values
+    print('RMSSE: {:.6}'.format(e.score(valid_pred)))
+
+if __name__ == '__main__':
+    sale_data = create_train_data(train_start=600,is_train=True)
+    sale_data = create_feature(sale_data)
+    sale_data = reduce_mem_usage(sale_data)
+
+    cat_feats = ['item_id', 'dept_id','store_id', 'cat_id', 'state_id'] + ["event_name_1", "event_type_1", "event_name_2", 'event_type_2'] + ['before_events','after_events']
+    useless_cols = ["id", "date", "sales", "d", "Weight"]
+    train_cols = sale_data.columns[~sale_data.columns.isin(useless_cols)]
+
+    # valid set中有8个新品，存在nan值。为了便于后续WRMSSE计算，先提取验证集再清洗nan【lgb可以处理nan值】
+    X_valid = sale_data.loc[(sale_data.date <= '2016-04-24') & (sale_data.date > '2016-03-27'),train_cols]
+    y_valid = sale_data.loc[(sale_data.date <= '2016-04-24') & (sale_data.date > '2016-03-27'),'sales']
+    # w_valid = sale_data.loc[(sale_data.date <= '2016-04-24') & (sale_data.date > '2016-03-27'),'Weight']
+
+    # 清洗数据，选择需要训练的数据
+    sale_data.dropna(inplace=True)
+
+    # X_train = sale_data[train_cols]
+    # y_train = sale_data["sales"]
+    X_train = sale_data.loc[sale_data.date <= '2016-03-27',train_cols]
+    y_train = sale_data.loc[sale_data.date <= '2016-03-27',"sales"]
+    # w = sale_data.loc[sale_data.date <= '2016-03-27',"Weight"]
+    train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_feats, free_raw_data=True)
+
+    valid_data = lgb.Dataset(X_valid, label=y_valid, categorical_feature=cat_feats, reference=train_data, free_raw_data=True) 
+
+    del sale_data
+    gc.collect()
+
+    m_lgb = train_model(train_data,valid_data)
+    joblib.dump(m_lgb,'lgb_v13.pkl')
+
+    # 实例化评估对象
+    train_df = pd.read_csv('sales_train_validation.csv')
+    cal_data = pd.read_csv('calendar.csv')
+    price_data = pd.read_csv('sell_prices.csv')
+    train_fold_df = train_df.iloc[:,:-28]
+    valid_fold_df = train_df.iloc[:,-28:].copy()
+    e = WRMSSEEvaluator(train_fold_df, valid_fold_df, cal_data, price_data)
+    del train_fold_df, train_df, cal_data, price_data
+
+    m_lgb.eval_valid(evaluate_wrmsse)
+
+    predict_ensemble(train_cols,m_lgb)
